@@ -1,5 +1,5 @@
 // 添加动画样式
-(function() {
+/*(function() {
     const style = document.createElement('style');
     style.textContent = `
         @keyframes pulse {
@@ -185,3 +185,4 @@ function displayVersionElement(element) {
 
 // 页面加载完成后添加版本信息
 document.addEventListener('DOMContentLoaded', addVersionInfoToFooter);
+*/
