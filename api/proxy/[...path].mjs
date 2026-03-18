@@ -407,26 +407,38 @@ export default async function handler(req, res) {
                 .send(processedM3u8); // 发送 M3U8 文本
 
         } else {
-            // --- 如果不是 M3U8，直接返回原始内容 ---
-            console.info(`直接返回非 M3U8 内容: ${targetUrl}, 类型: ${contentType}`);
+// --- 如果不是 M3U8，直接返回原始内容 ---
+console.info(`直接返回非 M3U8 内容: ${targetUrl}, 类型: ${contentType}`);
 
-            // 设置原始响应头，但排除有问题的头和 CORS 头（已设置）
-            responseHeaders.forEach((value, key) => {
-                 const lowerKey = key.toLowerCase();
-                 if (!lowerKey.startsWith('access-control-') &&
-                     lowerKey !== 'content-encoding' && // 很重要！
-                     lowerKey !== 'content-length') {   // 很重要！
-                     res.setHeader(key, value); // 设置其他原始头
-                 }
-             });
-            // 设置我们自己的缓存策略
-            res.setHeader('Cache-Control', `public, max-age=${CACHE_TTL}`);
+// ✅ 修改点1：设置 Content-Type（必须）
+if (contentType) {
+    res.setHeader('Content-Type', contentType);
+}
 
-            // 发送原始（已解压）内容
-            if (content instanceof ArrayBuffer) {
-            res.status(200).send(Buffer.from(content)); // ✅ 二进制正确返回
-            } else {
-            res.status(200).send(content);
+// ✅ 修改点2：透传关键头（很重要）
+const passHeaders = [
+    'content-type',
+    'content-length',
+    'accept-ranges',
+    'content-range',
+    'etag',
+    'last-modified',
+];
+
+responseHeaders.forEach((value, key) => {
+    if (passHeaders.includes(key.toLowerCase())) {
+        res.setHeader(key, value);
+    }
+});
+
+// ✅ 修改点3：缓存
+res.setHeader('Cache-Control', `public, max-age=${CACHE_TTL}`);
+
+// ✅ 修改点4（关键）：二进制正确返回
+if (content instanceof ArrayBuffer) {
+    return res.status(200).end(Buffer.from(content));
+} else {
+    return res.status(200).send(content);
 }
         }
 
