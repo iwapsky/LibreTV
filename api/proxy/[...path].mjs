@@ -139,41 +139,63 @@ async function fetchContentWithType(targetUrl, requestHeaders) {
     // 准备请求头
     const headers = {
         'User-Agent': getRandomUserAgent(),
-        'Accept': requestHeaders['accept'] || '*/*', // 传递原始 Accept 头（如果有）
+        'Accept': requestHeaders['accept'] || '*/*',
         'Accept-Language': requestHeaders['accept-language'] || 'zh-CN,zh;q=0.9,en;q=0.8',
-        // 尝试设置一个合理的 Referer
-        'Referer': requestHeaders['referer'] || new URL(targetUrl).origin,
+
+        // ✅ 修改点：增强 Referer（防盗链，尤其豆瓣）
+        'Referer': requestHeaders['referer'] || 'https://www.douban.com/',
     };
+
+    // ✅ 修改点：支持 Range（视频/大文件更稳）
+    if (requestHeaders['range']) {
+        headers['Range'] = requestHeaders['range'];
+    }
+
     // 清理空值的头
-    Object.keys(headers).forEach(key => headers[key] === undefined || headers[key] === null || headers[key] === '' ? delete headers[key] : {});
+    Object.keys(headers).forEach(key =>
+        headers[key] === undefined || headers[key] === null || headers[key] === ''
+            ? delete headers[key]
+            : {}
+    );
 
     logDebug(`准备请求目标: ${targetUrl}，请求头: ${JSON.stringify(headers)}`);
 
     try {
-        // 发起 fetch 请求
-        const response = await fetch(targetUrl, { headers, redirect: 'follow' });
+        const response = await fetch(targetUrl, {
+            headers,
+            redirect: 'follow'
+        });
 
-        // 检查响应是否成功
         if (!response.ok) {
-            const errorBody = await response.text().catch(() => ''); // 尝试获取错误响应体
-            logDebug(`请求失败: ${response.status} ${response.statusText} - ${targetUrl}`);
-            // 创建一个包含状态码的错误对象
-            const err = new Error(`HTTP 错误 ${response.status}: ${response.statusText}. URL: ${targetUrl}. Body: ${errorBody.substring(0, 200)}`);
-            err.status = response.status; // 将状态码附加到错误对象
-            throw err; // 抛出错误
+            const errorBody = await response.text().catch(() => '');
+            const err = new Error(
+                `HTTP 错误 ${response.status}: ${response.statusText}. URL: ${targetUrl}. Body: ${errorBody.substring(0, 200)}`
+            );
+            err.status = response.status;
+            throw err;
         }
 
-        // 读取响应内容
-        const content = await response.text();
         const contentType = response.headers.get('content-type') || '';
-        logDebug(`请求成功: ${targetUrl}, Content-Type: ${contentType}, 内容长度: ${content.length}`);
-        // 返回结果
+
+        let content;
+
+        // ✅ 修改点（核心修复）：区分文本 / 二进制
+        if (
+            contentType.includes('text') ||
+            contentType.includes('json') ||
+            contentType.includes('mpegurl')
+        ) {
+            content = await response.text(); // 文本（m3u8等）
+        } else {
+            content = await response.arrayBuffer(); // 二进制（图片/视频）
+        }
+
+        logDebug(`请求成功: ${targetUrl}, Content-Type: ${contentType}`);
+
         return { content, contentType, responseHeaders: response.headers };
 
     } catch (error) {
-        // 捕获 fetch 本身的错误（网络、超时等）或上面抛出的 HTTP 错误
         logDebug(`请求异常 ${targetUrl}: ${error.message}`);
-        // 重新抛出，确保包含原始错误信息
         throw new Error(`请求目标 URL 失败 ${targetUrl}: ${error.message}`);
     }
 }
@@ -401,7 +423,11 @@ export default async function handler(req, res) {
             res.setHeader('Cache-Control', `public, max-age=${CACHE_TTL}`);
 
             // 发送原始（已解压）内容
+            if (content instanceof ArrayBuffer) {
+            res.status(200).send(Buffer.from(content)); // ✅ 二进制正确返回
+            } else {
             res.status(200).send(content);
+}
         }
 
     // ---- 结束主处理逻辑的 try 块 ----
