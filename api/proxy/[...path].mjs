@@ -2,6 +2,7 @@
 
 import fetch from 'node-fetch';
 import { URL } from 'url'; // 使用 Node.js 内置 URL 处理
+import crypto from 'crypto'; // 导入 crypto 模块用于密码哈希
 
 // --- 配置 (从环境变量读取) ---
 const DEBUG_ENABLED = process.env.DEBUG === 'true';
@@ -139,63 +140,41 @@ async function fetchContentWithType(targetUrl, requestHeaders) {
     // 准备请求头
     const headers = {
         'User-Agent': getRandomUserAgent(),
-        'Accept': requestHeaders['accept'] || '*/*',
+        'Accept': requestHeaders['accept'] || '*/*', // 传递原始 Accept 头（如果有）
         'Accept-Language': requestHeaders['accept-language'] || 'zh-CN,zh;q=0.9,en;q=0.8',
-
-        // ✅ 修改点：增强 Referer（防盗链，尤其豆瓣）
-        'Referer': requestHeaders['referer'] || 'https://www.douban.com/',
+        // 尝试设置一个合理的 Referer
+        'Referer': requestHeaders['referer'] || new URL(targetUrl).origin,
     };
-
-    // ✅ 修改点：支持 Range（视频/大文件更稳）
-    if (requestHeaders['range']) {
-        headers['Range'] = requestHeaders['range'];
-    }
-
     // 清理空值的头
-    Object.keys(headers).forEach(key =>
-        headers[key] === undefined || headers[key] === null || headers[key] === ''
-            ? delete headers[key]
-            : {}
-    );
+    Object.keys(headers).forEach(key => headers[key] === undefined || headers[key] === null || headers[key] === '' ? delete headers[key] : {});
 
     logDebug(`准备请求目标: ${targetUrl}，请求头: ${JSON.stringify(headers)}`);
 
     try {
-        const response = await fetch(targetUrl, {
-            headers,
-            redirect: 'follow'
-        });
+        // 发起 fetch 请求
+        const response = await fetch(targetUrl, { headers, redirect: 'follow' });
 
+        // 检查响应是否成功
         if (!response.ok) {
-            const errorBody = await response.text().catch(() => '');
-            const err = new Error(
-                `HTTP 错误 ${response.status}: ${response.statusText}. URL: ${targetUrl}. Body: ${errorBody.substring(0, 200)}`
-            );
-            err.status = response.status;
-            throw err;
+            const errorBody = await response.text().catch(() => ''); // 尝试获取错误响应体
+            logDebug(`请求失败: ${response.status} ${response.statusText} - ${targetUrl}`);
+            // 创建一个包含状态码的错误对象
+            const err = new Error(`HTTP 错误 ${response.status}: ${response.statusText}. URL: ${targetUrl}. Body: ${errorBody.substring(0, 200)}`);
+            err.status = response.status; // 将状态码附加到错误对象
+            throw err; // 抛出错误
         }
 
+        // 读取响应内容
+        const content = await response.text();
         const contentType = response.headers.get('content-type') || '';
-
-        let content;
-
-        // ✅ 修改点（核心修复）：区分文本 / 二进制
-        if (
-            contentType.includes('text') ||
-            contentType.includes('json') ||
-            contentType.includes('mpegurl')
-        ) {
-            content = await response.text(); // 文本（m3u8等）
-        } else {
-            content = await response.arrayBuffer(); // 二进制（图片/视频）
-        }
-
-        logDebug(`请求成功: ${targetUrl}, Content-Type: ${contentType}`);
-
+        logDebug(`请求成功: ${targetUrl}, Content-Type: ${contentType}, 内容长度: ${content.length}`);
+        // 返回结果
         return { content, contentType, responseHeaders: response.headers };
 
     } catch (error) {
+        // 捕获 fetch 本身的错误（网络、超时等）或上面抛出的 HTTP 错误
         logDebug(`请求异常 ${targetUrl}: ${error.message}`);
+        // 重新抛出，确保包含原始错误信息
         throw new Error(`请求目标 URL 失败 ${targetUrl}: ${error.message}`);
     }
 }
@@ -321,6 +300,40 @@ async function processMasterPlaylist(url, content, recursionDepth) {
     return await processM3u8Content(bestVariantUrl, variantContent, recursionDepth + 1);
 }
 
+/**
+ * 验证代理请求的鉴权
+ */
+async function validateAuth(req) {
+    const authHash = req.query.auth;
+    const timestamp = req.query.t;
+    
+    // 获取服务器端密码哈希
+    const serverPassword = process.env.PASSWORD;
+    if (!serverPassword) {
+        console.error('服务器未设置 PASSWORD 环境变量，代理访问被拒绝');
+        return false;
+    }
+    
+    // 使用 crypto 模块计算 SHA-256 哈希
+    const serverPasswordHash = crypto.createHash('sha256').update(serverPassword).digest('hex');
+    
+    if (!authHash || authHash !== serverPasswordHash) {
+        console.warn('代理请求鉴权失败：密码哈希不匹配');
+        return false;
+    }
+    
+    // 验证时间戳（10分钟有效期）
+    if (timestamp) {
+        const now = Date.now();
+        const maxAge = 10 * 60 * 1000; // 10分钟
+        if (now - parseInt(timestamp) > maxAge) {
+            console.warn('代理请求鉴权失败：时间戳过期');
+            return false;
+        }
+    }
+    
+    return true;
+}
 
 // --- Vercel Handler 函数 ---
 export default async function handler(req, res) {
@@ -346,6 +359,17 @@ export default async function handler(req, res) {
     let targetUrl = null; // 初始化目标 URL
 
     try { // ---- 开始主处理逻辑的 try 块 ----
+
+        // --- 验证鉴权 ---
+        const isAuthorized = await validateAuth(req);
+        if (!isAuthorized) {
+            console.warn('代理请求鉴权失败');
+            res.status(401).json({
+                success: false,
+                error: '代理访问未授权：请检查密码配置或鉴权参数'
+            });
+            return;
+        }
 
         // --- 提取目标 URL (主要依赖 req.query["...path"]) ---
         // Vercel 将 :path* 捕获的内容（可能包含斜杠）放入 req.query["...path"] 数组
@@ -407,39 +431,23 @@ export default async function handler(req, res) {
                 .send(processedM3u8); // 发送 M3U8 文本
 
         } else {
-// --- 如果不是 M3U8，直接返回原始内容 ---
-console.info(`直接返回非 M3U8 内容: ${targetUrl}, 类型: ${contentType}`);
+            // --- 如果不是 M3U8，直接返回原始内容 ---
+            console.info(`直接返回非 M3U8 内容: ${targetUrl}, 类型: ${contentType}`);
 
-// ✅ 修改点1：设置 Content-Type（必须）
-if (contentType) {
-    res.setHeader('Content-Type', contentType);
-}
+            // 设置原始响应头，但排除有问题的头和 CORS 头（已设置）
+            responseHeaders.forEach((value, key) => {
+                 const lowerKey = key.toLowerCase();
+                 if (!lowerKey.startsWith('access-control-') &&
+                     lowerKey !== 'content-encoding' && // 很重要！
+                     lowerKey !== 'content-length') {   // 很重要！
+                     res.setHeader(key, value); // 设置其他原始头
+                 }
+             });
+            // 设置我们自己的缓存策略
+            res.setHeader('Cache-Control', `public, max-age=${CACHE_TTL}`);
 
-// ✅ 修改点2：透传关键头（很重要）
-const passHeaders = [
-    'content-type',
-    'content-length',
-    'accept-ranges',
-    'content-range',
-    'etag',
-    'last-modified',
-];
-
-responseHeaders.forEach((value, key) => {
-    if (passHeaders.includes(key.toLowerCase())) {
-        res.setHeader(key, value);
-    }
-});
-
-// ✅ 修改点3：缓存
-res.setHeader('Cache-Control', `public, max-age=${CACHE_TTL}`);
-
-// ✅ 修改点4（关键）：二进制正确返回
-if (content instanceof ArrayBuffer) {
-    return res.status(200).end(Buffer.from(content));
-} else {
-    return res.status(200).send(content);
-}
+            // 发送原始（已解压）内容
+            res.status(200).send(content);
         }
 
     // ---- 结束主处理逻辑的 try 块 ----
